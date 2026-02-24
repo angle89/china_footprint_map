@@ -1,9 +1,6 @@
 ﻿# 中国城市足迹地图 | China Footprint Map
 
 > 交互式中国城市足迹记录，建筑师美学风格
-> Designed by **Zehao CHEN** · Southeast University, School of Architecture
-
----
 
 ## 功能
 
