@@ -7,6 +7,16 @@
           <span class="stats-label">已访问城市：</span>
           <span class="stats-value">{{ visitedCities.length }}</span>
         </div>
+        <!-- 面包屑 -->
+        <div class="breadcrumb" v-if="drillState.phase > 0">
+          <button class="breadcrumb-btn" @click="resetToNational">全国</button>
+          <span class="breadcrumb-sep">›</span>
+          <span class="breadcrumb-prov">{{ drillState.province }}</span>
+          <template v-if="drillState.phase >= 2">
+            <span class="breadcrumb-sep">›</span>
+            <span class="breadcrumb-city">{{ drillState.city }}</span>
+          </template>
+        </div>
       </div>
 
       <!-- 配色设置 -->
@@ -184,9 +194,8 @@ const highlightColor = ref(
 );
 
 // ───── 缩放与下钻状态 ─────
-const currentZoom = ref(1);
-const LABEL_ZOOM_THRESHOLD = 2.5; // 低于此值显示省名，高于时省名隐藏
-const drillState = ref({ city: null, phase: 0 }); // phase: 0=全国, 1=省视角, 2=市视角
+// phase: 0=全国(只能选省), 1=省已选中(可点亮城市), 2=市视角
+const drillState = ref({ province: null, city: null, phase: 0 });
 
 // ───── 省/市地理位置缓存 ─────
 const provinceCentroids = ref([]); // [{name, center:[lng,lat]}]
@@ -221,12 +230,15 @@ const clearSearch = () => {
 };
 
 const selectCity = (cityName) => {
+  // 搜索直接切换，同时进入该城市所在省的阶段2
+  const provInfo = cityProvinceMap.value[cityName];
+  if (provInfo) {
+    drillState.value = { province: provInfo.province, city: cityName, phase: 2 };
+    flyToCity(cityName);
+  }
   toggleCity(cityName, "");
   searchQuery.value = cityName;
   showDropdown.value = false;
-  if (chartInstance) {
-    chartInstance.dispatchAction({ type: "geoRoam", geoIndex: 0 });
-  }
 };
 const selectFirstResult = () => {
   const idx = activeIndex.value >= 0 ? activeIndex.value : 0;
@@ -235,6 +247,14 @@ const selectFirstResult = () => {
 const handleOutsideClick = (e) => {
   if (searchWrapperRef.value && !searchWrapperRef.value.contains(e.target))
     closeDropdown();
+};
+
+// ───── 辅助：根据省名获取 provinceCode ─────
+const getProvinceCodeByName = (provinceName) => {
+  for (const info of Object.values(cityProvinceMap.value)) {
+    if (info.province === provinceName) return info.provinceCode;
+  }
+  return null;
 };
 
 // ───── geo.regions 计算 ─────
@@ -258,10 +278,19 @@ const getGeoRegions = () => {
     if (info) litCodes.add(info.provinceCode);
   });
 
+  // 当前选中的省份 code
+  const selectedCode = drillState.value.province
+    ? getProvinceCodeByName(drillState.value.province)
+    : null;
+
   const regions = [];
-  // 省内未访问 → 用户配色（highlightColor）
   Object.entries(cityProvinceMap.value).forEach(([name, info]) => {
-    if (!visitedNames.has(name) && litCodes.has(info.provinceCode)) {
+    if (visitedNames.has(name)) return; // 已访问的单独处理
+    if (selectedCode && info.provinceCode === selectedCode) {
+      // 选中省份内的未访问城市 → 蓝色选中底色
+      regions.push({ name, itemStyle: { areaColor: "#DCE8F5" } });
+    } else if (litCodes.has(info.provinceCode)) {
+      // 有访问记录的省份内未访问城市 → 用户高亮色
       regions.push({ name, itemStyle: { areaColor: highlightColor.value } });
     }
   });
@@ -445,36 +474,46 @@ const initMap = async () => {
       if (params.componentType !== "geo" || !params.name) return;
       const city = params.name;
       const provInfo = cityProvinceMap.value[city];
+      if (!provInfo) return;
 
-      if (
-        drillState.value.city === city &&
-        drillState.value.phase === 1
-      ) {
-        // 第二次点击同一城市：飞入市视角 + 切换点亮
-        flyToCity(city);
-        toggleCity(city, "");
-        drillState.value.phase = 2;
-      } else if (drillState.value.phase >= 2 && drillState.value.city === city) {
-        // 已在市视角，再次点击仅切换点亮
-        toggleCity(city, "");
+      const { province, phase } = drillState.value;
+
+      if (phase === 0) {
+        // 阶段0：任何点击先选中省份，飞入省视角，不点亮城市
+        flyToProvince(provInfo.province);
+        drillState.value = { province: provInfo.province, city, phase: 1 };
+        updateMapOption();
+      } else if (phase === 1) {
+        if (provInfo.province === province) {
+          // 同省城市：飞入市视角 + 切换点亮
+          flyToCity(city);
+          toggleCity(city, "");
+          drillState.value = { province, city, phase: 2 };
+        } else {
+          // 不同省：切换省选中
+          flyToProvince(provInfo.province);
+          drillState.value = { province: provInfo.province, city, phase: 1 };
+          updateMapOption();
+        }
       } else {
-        // 第一次点击或点击不同城市：飞入省视角
-        if (provInfo) flyToProvince(provInfo.province);
-        drillState.value = { city, phase: 1 };
+        // 阶段2
+        if (provInfo.province === province) {
+          // 同省任意城市：飞入 + 切换点亮
+          flyToCity(city);
+          toggleCity(city, "");
+          drillState.value.city = city;
+        } else {
+          // 切换到新省
+          flyToProvince(provInfo.province);
+          drillState.value = { province: provInfo.province, city, phase: 1 };
+          updateMapOption();
+        }
       }
     });
     window.addEventListener("resize", handleResize);
     document.addEventListener("click", handleOutsideClick);
 
-    // georoam：跟踪缩放，切换标签可见性
-    chartInstance.on("georoam", () => {
-      const option = chartInstance.getOption();
-      const zoom = option?.geo?.[0]?.zoom ?? 1;
-      if (Math.abs(zoom - currentZoom.value) > 0.05) {
-        currentZoom.value = zoom;
-        updateLabels();
-      }
-    });
+    // georoam：无需额外处理，省名标签始终显示
     console.log("✅ 地图初始化成功");
   } catch (error) {
     console.error("❌ 地图初始化失败:", error);
@@ -512,7 +551,7 @@ const initMapOption = () => {
             `
                 : ""
             }
-            <p style="margin-top:8px;color:#999;font-size:12px">💡 ${drillState.value.phase === 0 ? "点击飞入省视角" : drillState.value.phase === 1 ? "再次点击飞入市视角并标记" : "点击切换标记"}</p>
+            <p style="margin-top:8px;color:#999;font-size:12px">💡 ${drillState.value.phase === 0 ? "点击选中所在省份" : drillState.value.province === cityProvinceMap.value[cityName]?.province ? (drillState.value.phase === 1 ? "点击飞入市视角并标记" : "点击切换标记") : "点击切换到该省份"}</p>
           </div>`;
         },
         backgroundColor: "transparent",
@@ -564,7 +603,7 @@ const initMapOption = () => {
           lineStyle: { color: "#777777", width: 1.8, opacity: 0.85 },
         },
         {
-          // 省名标签层：低缩放时显示，高缩放时隐藏
+          // 省名标签层：始终显示，不受缩放影响
           id: "province-labels",
           type: "scatter",
           coordinateSystem: "geo",
@@ -577,12 +616,12 @@ const initMapOption = () => {
             name: p.name,
           })),
           label: {
-            show: currentZoom.value < LABEL_ZOOM_THRESHOLD,
+            show: true,
             formatter: (params) => params.name,
             fontSize: 11,
             color: "#444",
             fontWeight: "bold",
-            textBorderColor: "rgba(255,255,255,0.8)",
+            textBorderColor: "rgba(255,255,255,0.85)",
             textBorderWidth: 2,
           },
         },
@@ -592,27 +631,10 @@ const initMapOption = () => {
   );
 };
 
-// 仅更新 geo.regions + 标签颜色（tooltip 也用 visitedColor），不重置缩放/平移
+// 仅更新 geo.regions，不重置缩放/平移
 const updateMapOption = () => {
   if (!chartInstance) return;
   chartInstance.setOption({ geo: { regions: getGeoRegions() } }, false);
-};
-
-// 根据当前缩放切换省名/市名标签可见性
-const updateLabels = () => {
-  if (!chartInstance) return;
-  const showProv = currentZoom.value < LABEL_ZOOM_THRESHOLD;
-  chartInstance.setOption(
-    {
-      series: [
-        {
-          id: "province-labels",
-          label: { show: showProv },
-        },
-      ],
-    },
-    false,
-  );
 };
 
 const handleResize = () => {
@@ -650,6 +672,15 @@ const resetColors = () => {
   highlightColor.value = "#FFFBEB";
   localStorage.removeItem("fp_visitedColor");
   localStorage.removeItem("fp_highlightColor");
+  updateMapOption();
+};
+
+// 返回全国视角
+const resetToNational = () => {
+  drillState.value = { province: null, city: null, phase: 0 };
+  if (chartInstance) {
+    chartInstance.setOption({ geo: { center: [104, 36], zoom: 1.2 } }, false);
+  }
   updateMapOption();
 };
 
@@ -853,6 +884,46 @@ onUnmounted(() => {
 .dropdown-leave-to {
   opacity: 0;
   transform: translateY(-6px);
+}
+
+/* ───── 面包屑导航 ───── */
+.breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  font-size: 12px;
+  color: #666;
+}
+
+.breadcrumb-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 12px;
+  color: #2a5b8c;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.breadcrumb-btn:hover {
+  color: #1a3f6a;
+}
+
+.breadcrumb-sep {
+  color: #aaa;
+  font-size: 12px;
+}
+
+.breadcrumb-prov {
+  color: #444;
+  font-weight: 600;
+}
+
+.breadcrumb-city {
+  color: #2a5b8c;
+  font-weight: 600;
 }
 
 /* 响应式设计 */
