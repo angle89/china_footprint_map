@@ -9,6 +9,25 @@
         </div>
       </div>
 
+      <!-- 配色设置 -->
+      <div class="color-settings">
+        <label class="color-label" title="已访问城市颜色">
+          <span>访问色</span>
+          <input type="color" v-model="visitedColor" @change="onColorChange" />
+        </label>
+        <label class="color-label" title="同省未访问城市高亮色">
+          <span>省高亮</span>
+          <input
+            type="color"
+            v-model="highlightColor"
+            @change="onColorChange"
+          />
+        </label>
+        <button class="color-reset" @click="resetColors" title="重置为默认配色">
+          重置
+        </button>
+      </div>
+
       <!-- 搜索框 -->
       <div class="search-wrapper" ref="searchWrapperRef">
         <div class="search-input-row">
@@ -158,6 +177,22 @@ const allCities = ref([]); // 全部城市名称
 const cityProvinceMap = ref({}); // 城市名 → { province, provinceCode }
 const provinceLines = ref([]); // 省界折线坐标（lng/lat）
 
+// ───── 配色方案（持久化至 localStorage）─────
+const visitedColor = ref(localStorage.getItem("fp_visitedColor") || "#2A5B8C");
+const highlightColor = ref(
+  localStorage.getItem("fp_highlightColor") || "#FFFBEB",
+);
+
+// ───── 缩放与下钻状态 ─────
+const currentZoom = ref(1);
+const LABEL_ZOOM_THRESHOLD = 2.5; // 低于此值显示省名，高于时省名隐藏
+const drillState = ref({ city: null, phase: 0 }); // phase: 0=全国, 1=省视角, 2=市视角
+
+// ───── 省/市地理位置缓存 ─────
+const provinceCentroids = ref([]); // [{name, center:[lng,lat]}]
+const provinceBboxData = ref({}); // {provinceName:{center,zoom}}
+const cityBboxData = ref({}); // {cityName:{center,zoom}}
+
 // ───── 搜索功能 ─────
 const searchQuery = ref("");
 const showDropdown = ref(false);
@@ -203,6 +238,16 @@ const handleOutsideClick = (e) => {
 };
 
 // ───── geo.regions 计算 ─────
+// 将 hex 颜色混入白色得到浅色版本（用于渐变终止色）
+const lightenHex = (hex, ratio = 0.35) => {
+  const h = hex.replace("#", "");
+  const r = parseInt(h.substr(0, 2), 16);
+  const g = parseInt(h.substr(2, 2), 16);
+  const b = parseInt(h.substr(4, 2), 16);
+  const m = (c) => Math.min(255, Math.round(c + (255 - c) * ratio));
+  return `rgb(${m(r)},${m(g)},${m(b)})`;
+};
+
 const getGeoRegions = () => {
   const visitedNames = new Set(visitedCities.value.map((c) => c.name));
 
@@ -214,13 +259,13 @@ const getGeoRegions = () => {
   });
 
   const regions = [];
-  // 省内未访问 → 极浅黄
+  // 省内未访问 → 用户配色（highlightColor）
   Object.entries(cityProvinceMap.value).forEach(([name, info]) => {
     if (!visitedNames.has(name) && litCodes.has(info.provinceCode)) {
-      regions.push({ name, itemStyle: { areaColor: "#FFFBEB" } });
+      regions.push({ name, itemStyle: { areaColor: highlightColor.value } });
     }
   });
-  // 已访问 → 蓝色渐变
+  // 已访问 → 用户配色（visitedColor）渐变
   visitedCities.value.forEach((city) => {
     regions.push({
       name: city.name,
@@ -232,11 +277,11 @@ const getGeoRegions = () => {
           x2: 1,
           y2: 1,
           colorStops: [
-            { offset: 0, color: "#2A5B8C" },
-            { offset: 1, color: "#4A7BA7" },
+            { offset: 0, color: visitedColor.value },
+            { offset: 1, color: lightenHex(visitedColor.value) },
           ],
         },
-        borderColor: "#2A5B8C",
+        borderColor: visitedColor.value,
         borderWidth: 0.8,
       },
     });
@@ -294,6 +339,36 @@ const handleExportImage = (type) => {
   }, 500);
 };
 
+// ───── 地理包围盒计算 ─────
+// China 全图经度范围约 62°、纬度范围约 35°，用于反算 zoom
+const CHINA_LNG_SPAN = 62;
+const CHINA_LAT_SPAN = 35;
+
+const computeBbox = (geom) => {
+  let minLng = Infinity,
+    maxLng = -Infinity,
+    minLat = Infinity,
+    maxLat = -Infinity;
+  const walk = (c) => {
+    if (!Array.isArray(c)) return;
+    if (typeof c[0] === "number") {
+      if (c[0] < minLng) minLng = c[0];
+      if (c[0] > maxLng) maxLng = c[0];
+      if (c[1] < minLat) minLat = c[1];
+      if (c[1] > maxLat) maxLat = c[1];
+    } else c.forEach(walk);
+  };
+  walk(geom.coordinates);
+  const dLng = Math.max(maxLng - minLng, 0.1);
+  const dLat = Math.max(maxLat - minLat, 0.1);
+  const zoom =
+    Math.min(CHINA_LNG_SPAN / dLng, CHINA_LAT_SPAN / dLat) * 0.65;
+  return {
+    center: [(minLng + maxLng) / 2, (minLat + maxLat) / 2],
+    zoom: Math.max(1.2, Math.min(zoom, 28)),
+  };
+};
+
 // ───── 初始化地图 ─────
 const initMap = async () => {
   if (!mapContainer.value) return;
@@ -328,6 +403,8 @@ const initMap = async () => {
 
     // 从省级 GeoJSON 提取省界折线坐标（lng/lat，供 lines 系列直接使用）
     const lines = [];
+    const centroids = [];
+    const bboxProv = {};
     (provGeoJson.features || []).forEach((feature) => {
       const geom = feature.geometry;
       if (!geom) return;
@@ -336,8 +413,26 @@ const initMap = async () => {
       polys.forEach((poly) =>
         poly.forEach((ring) => lines.push({ coords: ring })),
       );
+      // 计算省份中心和缩放
+      const bb = computeBbox(geom);
+      const name = feature.properties?.name || "";
+      if (name) {
+        centroids.push({ name, center: bb.center });
+        bboxProv[name] = bb;
+      }
     });
     provinceLines.value = lines;
+    provinceCentroids.value = centroids;
+    provinceBboxData.value = bboxProv;
+
+    // 计算各市的中心和缩放
+    const bboxCity = {};
+    (cityGeoJson.features || []).forEach((feature) => {
+      const name = feature.properties?.name;
+      if (!name || !feature.geometry) return;
+      bboxCity[name] = computeBbox(feature.geometry);
+    });
+    cityBboxData.value = bboxCity;
 
     echarts.registerMap("china_cities", cityGeoJson);
     // china_provinces 不再需要注册，省界线直接用坐标渲染
@@ -347,12 +442,39 @@ const initMap = async () => {
 
     // 单个 geo 组件，没有同步问题，不需要 georoam 监听
     chartInstance.on("click", (params) => {
-      if (params.componentType === "geo" && params.name) {
-        toggleCity(params.name, "");
+      if (params.componentType !== "geo" || !params.name) return;
+      const city = params.name;
+      const provInfo = cityProvinceMap.value[city];
+
+      if (
+        drillState.value.city === city &&
+        drillState.value.phase === 1
+      ) {
+        // 第二次点击同一城市：飞入市视角 + 切换点亮
+        flyToCity(city);
+        toggleCity(city, "");
+        drillState.value.phase = 2;
+      } else if (drillState.value.phase >= 2 && drillState.value.city === city) {
+        // 已在市视角，再次点击仅切换点亮
+        toggleCity(city, "");
+      } else {
+        // 第一次点击或点击不同城市：飞入省视角
+        if (provInfo) flyToProvince(provInfo.province);
+        drillState.value = { city, phase: 1 };
       }
     });
     window.addEventListener("resize", handleResize);
     document.addEventListener("click", handleOutsideClick);
+
+    // georoam：跟踪缩放，切换标签可见性
+    chartInstance.on("georoam", () => {
+      const option = chartInstance.getOption();
+      const zoom = option?.geo?.[0]?.zoom ?? 1;
+      if (Math.abs(zoom - currentZoom.value) > 0.05) {
+        currentZoom.value = zoom;
+        updateLabels();
+      }
+    });
     console.log("✅ 地图初始化成功");
   } catch (error) {
     console.error("❌ 地图初始化失败:", error);
@@ -365,6 +487,9 @@ const initMapOption = () => {
   chartInstance.setOption(
     {
       backgroundColor: "#F4F1EA",
+      animation: true,
+      animationDurationUpdate: 600,
+      animationEasingUpdate: "cubicOut",
       tooltip: {
         trigger: "item",
         formatter: (params) => {
@@ -378,7 +503,7 @@ const initMapOption = () => {
             <h3>${cityName}</h3>
             ${provInfo ? `<p><span class="label">所属省份：</span><span class="value" style="color:#666">${provInfo.province}</span></p>` : ""}
             <p><span class="label">状态：</span>
-              <span class="value" style="color:${visited ? "#2A5B8C" : "#999"}">${visited ? "✓ 已访问" : "未访问"}</span></p>
+              <span class="value" style="color:${visited ? visitedColor.value : "#999"}">${visited ? "✓ 已访问" : "未访问"}</span></p>
             ${
               visited && cityData
                 ? `
@@ -387,7 +512,7 @@ const initMapOption = () => {
             `
                 : ""
             }
-            <p style="margin-top:8px;color:#999;font-size:12px">💡 点击${visited ? "取消" : "标记"}访问</p>
+            <p style="margin-top:8px;color:#999;font-size:12px">💡 ${drillState.value.phase === 0 ? "点击飞入省视角" : drillState.value.phase === 1 ? "再次点击飞入市视角并标记" : "点击切换标记"}</p>
           </div>`;
         },
         backgroundColor: "transparent",
@@ -399,8 +524,9 @@ const initMapOption = () => {
       geo: {
         map: "china_cities",
         roam: true,
-        scaleLimit: { min: 1, max: 5 },
+        scaleLimit: { min: 0.5, max: 40 },
         aspectScale: 0.85,
+        label: { show: false },
         itemStyle: {
           areaColor: "#FFFFFF",
           borderColor: "#CCCCCC",
@@ -410,7 +536,7 @@ const initMapOption = () => {
           label: {
             show: true,
             fontSize: 11,
-            color: "#2A5B8C",
+            color: "#333",
             fontWeight: 600,
           },
           itemStyle: {
@@ -426,7 +552,8 @@ const initMapOption = () => {
       },
       series: [
         {
-          // 省界线叠加层：共享 geo 坐标系，缩放平移完全同步，无需任何同步逻辑
+          // 省界线叠加层：共享 geo 坐标系，缩放平移完全同步
+          id: "province-borders",
           type: "lines",
           coordinateSystem: "geo",
           geoIndex: 0,
@@ -436,20 +563,94 @@ const initMapOption = () => {
           data: provinceLines.value,
           lineStyle: { color: "#777777", width: 1.8, opacity: 0.85 },
         },
+        {
+          // 省名标签层：低缩放时显示，高缩放时隐藏
+          id: "province-labels",
+          type: "scatter",
+          coordinateSystem: "geo",
+          geoIndex: 0,
+          silent: true,
+          zlevel: 3,
+          symbolSize: 0,
+          data: provinceCentroids.value.map((p) => ({
+            value: p.center,
+            name: p.name,
+          })),
+          label: {
+            show: currentZoom.value < LABEL_ZOOM_THRESHOLD,
+            formatter: (params) => params.name,
+            fontSize: 11,
+            color: "#444",
+            fontWeight: "bold",
+            textBorderColor: "rgba(255,255,255,0.8)",
+            textBorderWidth: 2,
+          },
+        },
       ],
     },
     false,
   );
 };
 
-// 仅更新 geo.regions，不重置缩放/平移状态
+// 仅更新 geo.regions + 标签颜色（tooltip 也用 visitedColor），不重置缩放/平移
 const updateMapOption = () => {
   if (!chartInstance) return;
   chartInstance.setOption({ geo: { regions: getGeoRegions() } }, false);
 };
 
+// 根据当前缩放切换省名/市名标签可见性
+const updateLabels = () => {
+  if (!chartInstance) return;
+  const showProv = currentZoom.value < LABEL_ZOOM_THRESHOLD;
+  chartInstance.setOption(
+    {
+      series: [
+        {
+          id: "province-labels",
+          label: { show: showProv },
+        },
+      ],
+    },
+    false,
+  );
+};
+
 const handleResize = () => {
   if (chartInstance) chartInstance.resize();
+};
+
+// ───── 飞入动画 ─────
+const flyTo = (center, zoom) => {
+  if (!chartInstance) return;
+  chartInstance.setOption({ geo: { center, zoom } }, false);
+};
+
+const flyToProvince = (provinceName) => {
+  const bb = provinceBboxData.value[provinceName];
+  if (!bb) return;
+  flyTo(bb.center, bb.zoom);
+};
+
+const flyToCity = (cityName) => {
+  const bb = cityBboxData.value[cityName];
+  if (!bb) return;
+  // 市级固定缩放上限，避免放太大
+  flyTo(bb.center, Math.min(bb.zoom, 18));
+};
+
+// 颜色变更：持久化并刷新地图
+const onColorChange = () => {
+  localStorage.setItem("fp_visitedColor", visitedColor.value);
+  localStorage.setItem("fp_highlightColor", highlightColor.value);
+  updateMapOption();
+};
+
+const resetColors = () => {
+  visitedColor.value = "#2A5B8C";
+  highlightColor.value = "#FFFBEB";
+  localStorage.removeItem("fp_visitedColor");
+  localStorage.removeItem("fp_highlightColor");
+  updateMapOption();
 };
 
 // 导出 JSON
@@ -673,5 +874,57 @@ onUnmounted(() => {
     flex: 1;
     min-width: 80px;
   }
+}
+
+/* ───── 配色设置 ───── */
+.color-settings {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.color-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+  font-size: 11px;
+  color: #666;
+  user-select: none;
+}
+
+.color-label input[type="color"] {
+  width: 32px;
+  height: 26px;
+  padding: 2px;
+  border: 1.5px solid #d0d0d0;
+  border-radius: 5px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.color-label input[type="color"]:hover {
+  border-color: #2a5b8c;
+}
+
+.color-reset {
+  height: 28px;
+  padding: 0 10px;
+  background: #fff;
+  border: 1.5px solid #d0d0d0;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #666;
+  cursor: pointer;
+  transition:
+    border-color 0.2s,
+    color 0.2s;
+}
+
+.color-reset:hover {
+  border-color: #2a5b8c;
+  color: #2a5b8c;
 }
 </style>
